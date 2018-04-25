@@ -17,7 +17,7 @@ import physicalgraph.zigbee.clusters.iaszone.ZoneStatus
 import physicalgraph.zigbee.zcl.DataType
 
 metadata {
-	definition(name: "SmartSense Multi Sensor", namespace: "smartthings", author: "SmartThings") {
+	definition(name: "SmartSense Multi Sensor", namespace: "smartthings", author: "SmartThings", runLocally: true, minHubCoreVersion: '000.017.0012', executeCommandsLocally: false) {
 
 		capability "Three Axis"
 		capability "Battery"
@@ -33,7 +33,6 @@ metadata {
 		fingerprint inClusters: "0000,0001,0003,0402,0500,0020,0B05,FC02", outClusters: "0019", manufacturer: "CentraLite", model: "3320"
 		fingerprint inClusters: "0000,0001,0003,0402,0500,0020,0B05,FC02", outClusters: "0019", manufacturer: "CentraLite", model: "3321"
 		fingerprint inClusters: "0000,0001,0003,0402,0500,0020,0B05,FC02", outClusters: "0019", manufacturer: "CentraLite", model: "3321-S", deviceJoinName: "Multipurpose Sensor"
-		fingerprint inClusters: "0000,0001,0003,0020,0402,0500,0B05", outClusters: "0019", manufacturer: "CentraLite", model: "3323-G", deviceJoinName: "Centralite Micro Door Sensor"
 		fingerprint inClusters: "0000,0001,0003,000F,0020,0402,0500,FC02", outClusters: "0019", manufacturer: "SmartThings", model: "multiv4", deviceJoinName: "Multipurpose Sensor"
 
 		attribute "status", "string"
@@ -88,8 +87,8 @@ metadata {
 			state("closed", label: 'Closed', icon: "st.contact.contact.closed", backgroundColor: "#00a0dc")
 		}
 		standardTile("acceleration", "device.acceleration", width: 2, height: 2) {
-			state("active", label: 'Active', icon: "st.motion.acceleration.active", backgroundColor: "#53a7c0")
-			state("inactive", label: 'Inactive', icon: "st.motion.acceleration.inactive", backgroundColor: "#ffffff")
+			state("active", label: 'Active', icon: "st.motion.acceleration.active", backgroundColor: "#00a0dc")
+			state("inactive", label: 'Inactive', icon: "st.motion.acceleration.inactive", backgroundColor: "#cccccc")
 		}
 		valueTile("temperature", "device.temperature", width: 2, height: 2) {
 			state("temperature", label: '${currentValue}°',
@@ -128,15 +127,19 @@ def parse(String description) {
 			Map descMap = zigbee.parseDescriptionAsMap(description)
 			if (descMap?.clusterInt == 0x0001 && descMap.commandInt != 0x07 && descMap?.value) {
 				maps << getBatteryResult(Integer.parseInt(descMap.value, 16))
+			} else if (descMap?.clusterInt == 0x0500 && descMap.attrInt == 0x0002) {
+				def zs = new ZoneStatus(zigbee.convertToInt(descMap.value, 16))
+				maps += translateZoneStatus(zs)
 			} else if (descMap?.clusterInt == zigbee.TEMPERATURE_MEASUREMENT_CLUSTER && descMap.commandInt == 0x07) {
 				if (descMap.data[0] == "00") {
 					log.debug "TEMP REPORTING CONFIG RESPONSE: $descMap"
-					sendEvent(name: "checkInterval", value: 60 * 12, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID])
+					sendEvent(name: "checkInterval", value: 60 * 12, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID, offlinePingable: "1"])
 				} else {
 					log.warn "TEMP REPORTING CONFIG FAILED- error code: ${descMap.data[0]}"
 				}
+			} else if (descMap?.clusterInt == zigbee.IAS_ZONE_CLUSTER && descMap.attrInt == zigbee.ATTRIBUTE_IAS_ZONE_STATUS && descMap?.value) {
+				maps += translateZoneStatus(new ZoneStatus(zigbee.convertToInt(descMap?.value)))
 			} else {
-
 				maps += handleAcceleration(descMap)
 			}
 		}
@@ -179,7 +182,7 @@ private List<Map> handleAcceleration(descMap) {
 			result += parseAxis(descMap.additionalAttrs)
 		}
 	} else if (descMap.clusterInt == 0xFC02 && descMap.attrInt == 0x0012) {
-		def addAttrs = descMap.additionalAttrs
+		def addAttrs = descMap.additionalAttrs ?: []
 		addAttrs << ["attrInt": descMap.attrInt, "value": descMap.value]
 		result += parseAxis(addAttrs)
 	}
@@ -191,6 +194,10 @@ private List<Map> parseAxis(List<Map> attrData) {
 	def x = hexToSignedInt(attrData.find { it.attrInt == 0x0012 }?.value)
 	def y = hexToSignedInt(attrData.find { it.attrInt == 0x0013 }?.value)
 	def z = hexToSignedInt(attrData.find { it.attrInt == 0x0014 }?.value)
+
+	if ([x, y ,z].any { it == null }) {
+		return []
+	}
 
 	def xyzResults = [:]
 	if (device.getDataValue("manufacturer") == "SmartThings") {
@@ -226,6 +233,11 @@ private List<Map> parseAxis(List<Map> attrData) {
 
 private List<Map> parseIasMessage(String description) {
 	ZoneStatus zs = zigbee.parseZoneStatus(description)
+
+	translateZoneStatus(zs)
+}
+
+private List<Map> translateZoneStatus(ZoneStatus zs) {
 	List<Map> results = []
 
 	if (garageSensor != "Yes") {
@@ -264,13 +276,32 @@ private Map getBatteryResult(rawValue) {
 			def pct = batteryMap[volts]
 			result.value = pct
 		} else {
+			def useOldBatt = shouldUseOldBatteryReporting()
 			def minVolts = 2.1
-			def maxVolts = 3.0
-			def pct = (volts - minVolts) / (maxVolts - minVolts)
-			def roundedPct = Math.round(pct * 100)
-			if (roundedPct <= 0)
-				roundedPct = 1
-			result.value = Math.min(100, roundedPct)
+			def maxVolts = useOldBatt ? 3.0 : 2.7
+
+			// Get the current battery percentage as a multiplier 0 - 1
+			def curValVolts = Integer.parseInt(device.currentState("battery")?.value ?: "100") / 100.0
+			// Find the corresponding voltage from our range
+			curValVolts = curValVolts * (maxVolts - minVolts) + minVolts
+			// Round to the nearest 10th of a volt
+			curValVolts = Math.round(10 * curValVolts) / 10.0
+			// Only update the battery reading if we don't have a last reading,
+			// OR we have received the same reading twice in a row
+			// OR we don't currently have a battery reading
+			// OR the value we just received is at least 2 steps off from the last reported value
+			// OR the device's firmware is older than 1.15.7
+			if(useOldBatt || state?.lastVolts == null || state?.lastVolts == volts || device.currentState("battery")?.value == null || Math.abs(curValVolts - volts) > 0.1) {
+				def pct = (volts - minVolts) / (maxVolts - minVolts)
+				def roundedPct = Math.round(pct * 100)
+				if (roundedPct <= 0)
+					roundedPct = 1
+				result.value = Math.min(100, roundedPct)
+			} else {
+				// Don't update as we want to smooth the battery values, but do report the last battery state for record keeping purposes
+				result.value = device.currentState("battery").value
+			}
+			state.lastVolts = volts
 		}
 	}
 
@@ -301,7 +332,7 @@ List<Map> garageEvent(zValue) {
  * PING is used by Device-Watch in attempt to reach the Device
  * */
 def ping() {
-	return zigbee.readAttribute(0x001, 0x0020) // Read the Battery Level
+	zigbee.readAttribute(zigbee.IAS_ZONE_CLUSTER, zigbee.ATTRIBUTE_IAS_ZONE_STATUS)
 }
 
 def refresh() {
@@ -310,7 +341,7 @@ def refresh() {
 	def refreshCmds = zigbee.readAttribute(zigbee.TEMPERATURE_MEASUREMENT_CLUSTER, 0x0000) +
 			zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0020) +
 			zigbee.readAttribute(0xFC02, 0x0010, [mfgCode: manufacturerCode]) +
-			zigbee.enrollResponse()
+			zigbee.readAttribute(zigbee.IAS_ZONE_CLUSTER, zigbee.ATTRIBUTE_IAS_ZONE_STATUS) + zigbee.enrollResponse()
 
 	return refreshCmds
 }
@@ -318,7 +349,7 @@ def refresh() {
 def configure() {
 	// Device-Watch allows 2 check-in misses from device + ping (plus 1 min lag time)
 	// enrolls with default periodic reporting until newer 5 min interval is confirmed
-	sendEvent(name: "checkInterval", value: 2 * 60 * 60 + 1 * 60, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID])
+	sendEvent(name: "checkInterval", value: 2 * 60 * 60 + 1 * 60, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID, offlinePingable: "1"])
 
 	log.debug "Configuring Reporting"
 	def configCmds = []
@@ -372,6 +403,10 @@ def updated() {
 }
 
 private hexToSignedInt(hexVal) {
+	if (!hexVal) {
+		return null
+	}
+
 	def unsignedVal = hexToInt(hexVal)
 	unsignedVal > 32767 ? unsignedVal - 65536 : unsignedVal
 }
@@ -382,6 +417,25 @@ private getManufacturerCode() {
 	} else {
 		return "0x104E"
 	}
+}
+
+private shouldUseOldBatteryReporting() {
+	def isFwVersionLess = true // By default use the old battery reporting
+	def deviceFwVer = "${device.getFirmwareVersion()}"
+	def deviceVersion = deviceFwVer.tokenize('.')  // We expect the format ###.###.### where ### is some integer
+
+	if (deviceVersion.size() == 3) {
+		def targetVersion = [1, 15, 7] // Centralite Firmware 1.15.7 contains battery smoothing fixes, so versions before that should NOT be smoothed
+		def devMajor = deviceVersion[0] as int
+		def devMinor = deviceVersion[1] as int
+		def devBuild = deviceVersion[2] as int
+
+		isFwVersionLess = ((devMajor < targetVersion[0]) ||
+			(devMajor == targetVersion[0] && devMinor < targetVersion[1]) ||
+			(devMajor == targetVersion[0] && devMinor == targetVersion[1] && devBuild < targetVersion[2]))
+	}
+
+	return isFwVersionLess // If f/w version is less than 1.15.7 then do NOT smooth battery reports and use the old reporting
 }
 
 private hexToInt(value) {
